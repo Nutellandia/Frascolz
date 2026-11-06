@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# AI Studio & Internal platform artifacts (Zero platform leaks to GitHub)
+.aistudio/
