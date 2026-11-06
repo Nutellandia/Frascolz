@@ -3,7 +3,7 @@
 **Created by Emilio Frascogna · FRS Software (Frascogna Software)**
 
 [![Language](https://img.shields.io/badge/Language-C99%20Pure-blue.svg)](https://en.wikipedia.org/wiki/C99)
-[![Dependencies](https://img.shields.io/badge/Dependencies-0%20(Zero)-success.svg)](https://github.com)
+[![Dependencies](https://img.shields.io/badge/Dependencies-Zero-success.svg)](#-executive-summary)
 [![License](https://img.shields.io/badge/License-Dual%20(Community%20%2B%20Commercial)-emerald.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/Tests-13%2F13%20Passing-brightgreen.svg)](src/core/frascolz.test.ts)
 [![RAM Scaling](https://img.shields.io/badge/RAM%20Scaling-16KB%20to%20128GB%2B-orange.svg)](#adaptive-ram-architecture)
