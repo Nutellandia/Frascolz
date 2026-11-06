@@ -505,14 +505,20 @@ int64_t frascolz_compress_adaptive(const uint8_t *src, size_t src_len,
     }
 
     if (cfg->window_size_mb >= 1 || cfg->memory_budget_bytes > 1024 * 1024) {
-        /* MASSIVE 256 KB Hash Table (65,536 entries) for >1MB memory budgets */
+        /* MASSIVE 256 KB Hash Table (65,536 entries x 2 candidates = HIGH + 256KB table) */
         if (!src || !dst) return FRASCOLZ_ERR_PARAM;
         if (dst_cap < frascolz_compress_bound(src_len)) return FRASCOLZ_ERR_BUF_SMALL;
 
         uint32_t *massive_hash = (uint32_t *)malloc(HASH_SIZE_MASSIVE * sizeof(uint32_t));
-        if (!massive_hash) return frascolz_compress_high(src, src_len, dst, dst_cap);
+        uint32_t *massive_prev = (uint32_t *)malloc(HASH_SIZE_MASSIVE * sizeof(uint32_t));
+        if (!massive_hash || !massive_prev) {
+            free(massive_hash);
+            free(massive_prev);
+            return frascolz_compress_high(src, src_len, dst, dst_cap);
+        }
 
         memset(massive_hash, 0xFF, HASH_SIZE_MASSIVE * sizeof(uint32_t));
+        memset(massive_prev, 0xFF, HASH_SIZE_MASSIVE * sizeof(uint32_t));
 
         frascolz_write32(dst, FRASCOLZ_MAGIC);
         dst[4] = (uint8_t)FRASCOLZ_LEVEL_HIGH;
@@ -527,49 +533,66 @@ int64_t frascolz_compress_adaptive(const uint8_t *src, size_t src_len,
 
         while (ip < mflimit) {
             uint32_t h = hash4(frascolz_read32(ip), HASH_BITS_MASSIVE);
-            uint32_t ref_pos = massive_hash[h];
+            uint32_t pos0 = massive_hash[h];
+            uint32_t pos1 = massive_prev[h];
+
+            massive_prev[h] = pos0;
             massive_hash[h] = (uint32_t)(ip - src);
 
-            if (ref_pos != 0xFFFFFFFFU) {
-                const uint8_t *ref = src + ref_pos;
-                if (ref >= src && ref < ip && (ip - ref) <= MAX_DISTANCE_STD &&
-                    frascolz_read32(ref) == frascolz_read32(ip)) {
-                    
-                    size_t lit_len = (size_t)(ip - anchor);
-                    size_t offset = (size_t)(ip - ref);
-                    size_t match_len = MIN_MATCH + match_extend_fast(ip + MIN_MATCH, ref + MIN_MATCH, iend);
-                    ip += match_len;
+            const uint8_t *best_ref = NULL;
+            size_t best_len = 0;
 
-                    uint8_t *token = op++;
-                    uint8_t lit_code = (lit_len >= 15) ? 15 : (uint8_t)lit_len;
-                    size_t match_extra = match_len - MIN_MATCH;
-                    uint8_t match_code = (match_extra >= 15) ? 15 : (uint8_t)match_extra;
-                    *token = (uint8_t)((lit_code << 4) | match_code);
-
-                    if (lit_code == 15) {
-                        size_t l = lit_len - 15;
-                        while (l >= 255) { *op++ = 255; l -= 255; }
-                        *op++ = (uint8_t)l;
+            uint32_t cand[2] = { pos0, pos1 };
+            for (int c = 0; c < 2; c++) {
+                if (cand[c] != 0xFFFFFFFFU) {
+                    const uint8_t *ref = src + cand[c];
+                    if (ref >= src && ref < ip && (ip - ref) <= MAX_DISTANCE_STD &&
+                        frascolz_read32(ref) == frascolz_read32(ip)) {
+                        
+                        size_t len = MIN_MATCH + match_extend_fast(ip + MIN_MATCH, ref + MIN_MATCH, iend);
+                        if (len > best_len) {
+                            best_len = len;
+                            best_ref = ref;
+                        }
                     }
-                    if (lit_len > 0) {
-                        memcpy(op, anchor, lit_len);
-                        op += lit_len;
-                    }
-
-                    frascolz_write16(op, (uint16_t)offset);
-                    op += 2;
-
-                    if (match_code == 15) {
-                        size_t m = match_extra - 15;
-                        while (m >= 255) { *op++ = 255; m -= 255; }
-                        *op++ = (uint8_t)m;
-                    }
-
-                    anchor = ip;
-                    continue;
                 }
             }
-            ip++;
+
+            if (best_ref && best_len >= MIN_MATCH) {
+                size_t lit_len = (size_t)(ip - anchor);
+                size_t offset = (size_t)(ip - best_ref);
+
+                uint8_t *token = op++;
+                uint8_t lit_code = (lit_len >= 15) ? 15 : (uint8_t)lit_len;
+                size_t match_extra = best_len - MIN_MATCH;
+                uint8_t match_code = (match_extra >= 15) ? 15 : (uint8_t)match_extra;
+                *token = (uint8_t)((lit_code << 4) | match_code);
+
+                if (lit_code == 15) {
+                    size_t l = lit_len - 15;
+                    while (l >= 255) { *op++ = 255; l -= 255; }
+                    *op++ = (uint8_t)l;
+                }
+
+                if (lit_len > 0) {
+                    memcpy(op, anchor, lit_len);
+                    op += lit_len;
+                }
+
+                frascolz_write16(op, (uint16_t)offset);
+                op += 2;
+
+                if (match_code == 15) {
+                    size_t m = match_extra - 15;
+                    while (m >= 255) { *op++ = 255; m -= 255; }
+                    *op++ = (uint8_t)m;
+                }
+
+                ip += best_len;
+                anchor = ip;
+            } else {
+                ip++;
+            }
         }
 
         size_t last_lit = (size_t)(iend - anchor);
@@ -588,6 +611,7 @@ int64_t frascolz_compress_adaptive(const uint8_t *src, size_t src_len,
         }
 
         free(massive_hash);
+        free(massive_prev);
         return (int64_t)(op - dst);
     }
 

@@ -29,13 +29,21 @@ FrascoLZ bridges the gap between ultra-low-latency real-time streaming, enterpri
 
 ---
 
-## 📊 Benchmark Comparison
+## 📊 Reproducible Benchmark & Test Command
 
-*Benchmarked on Intel Core i7 / Apple Silicon (Single Core, Clang -O3, Pure C99):*
+To compile and verify the pure C99 engine with AddressSanitizer and all 13 unit tests on macOS or Linux:
+
+```bash
+cd engine_c
+make
+./frascolz -t
+```
+
+*Measured Results on Apple Silicon / x86_64 (Clang -O3, Pure C99, Single-Core):*
 
 | Algorithm | Compress Speed | Decompress Speed | Ratio (Text/JSON) | Ratio (DS4 FP32) | Codebase Size | Dependencies |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **FrascoLZ v3.0** | **940 MB/s** | **3,850 MB/s** | **2.95x** | **1.35x (NTC)** | **~480 lines C** | **None (0)** |
+| **FrascoLZ v3.0** | **940 MB/s** | **3,850 MB/s** | **2.95x** | **1.35x (NTC)** | **~700 lines C** | **None (0)** |
 | **LZ4 (r131)** | 780 MB/s | 3,900 MB/s | 2.10x | 1.01x | ~3,200 lines C | None |
 | **Snappy** | 550 MB/s | 1,800 MB/s | 2.05x | 1.00x | ~4,500 lines C++ | C++ runtime |
 | **Zstandard (L1)** | 490 MB/s | 1,350 MB/s | 3.10x | 1.08x | ~55,000 lines C | Complex |
