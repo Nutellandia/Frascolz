@@ -1,0 +1,7 @@
+{
+  "name": "FrascoLZ Producer Suite - FRS Compression Engine",
+  "description": "Motore di compressione dati ultra-veloce in C puro e suite di benchmark per game streaming, cloud asset delivery e telecomunicazioni, sviluppato da Emilio Frascogna (FRS).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

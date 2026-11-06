@@ -1,0 +1,38 @@
+Business Source License 1.1
+
+Parameters:
+
+Licensor:           Emilio Frascogna (FRS Software)
+Licensed Work:      FrascoLZ v3.0 Universal Lossless Compression Engine (including engine_c and core libraries)
+Change Date:        2029-01-01
+Change License:     Apache License, Version 2.0
+Additional Use Grant:
+                    You may use the Licensed Work free of charge for non-commercial use,
+                    development, testing, educational purposes, or in production environments
+                    where the aggregate gross revenue of your organization is less than
+                    $100,000 USD per year.
+
+                    For commercial production use exceeding this limit, or for integration
+                    into closed-source proprietary software products, a separate FRS Commercial
+                    License must be obtained from the Licensor (contact: Nos_1@icloud.com).
+
+Text of the License:
+
+The Licensor hereby grants you the right to copy, modify, create derivative works, redistribute,
+and make non-production use of the Licensed Work. The Licensor also grants you the rights to
+make Production use to the extent permitted by the Additional Use Grant.
+
+Effective on the Change Date, or the twelfth anniversary of the first date the Licensed Work
+was released to the public by the Licensor (whichever is earlier), the Licensor hereby grants
+you rights under the terms of the Change License, and the terms of this License are terminated
+with respect to the Licensed Work.
+
+Notice:
+The Licensed Work is provided "as is", without warranty of any kind, express or implied,
+including but not limited to the warranties of merchantability, fitness for a particular
+purpose and noninfringement. In no event shall the authors or copyright holders be liable
+for any claim, damages or other liability, whether in an action of contract, tort or otherwise,
+arising from, out of or in connection with the software or the use or other dealings in the
+software.
+
+Copyright (c) 2026 Emilio Frascogna. All rights reserved.
