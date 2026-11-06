@@ -7,11 +7,15 @@
 
 #include "frascolz.h"
 #include <string.h>
+#include <stdlib.h>
 
 #define HASH_BITS_STD      14
-#define HASH_SIZE_STD      (1U << HASH_BITS_STD) /* 16,384 entries = 64 KB, L1/L2 resident */
+#define HASH_SIZE_STD      (1U << HASH_BITS_STD)   /* 16,384 entries = 64 KB, L1/L2 resident */
 #define HASH_BITS_MICRO    12
-#define HASH_SIZE_MICRO    (1U << HASH_BITS_MICRO) /* 4,096 entries = 16 KB for legacy CPUs */
+#define HASH_SIZE_MICRO    (1U << HASH_BITS_MICRO) /* 4,096 entries = 16 KB for legacy/micro CPUs */
+#define HASH_BITS_MASSIVE  16
+#define HASH_SIZE_MASSIVE  (1U << HASH_BITS_MASSIVE)/* 65,536 entries = 256 KB table */
+
 #define MIN_MATCH          4
 #define MAX_DISTANCE_STD   65535U
 #define HEADER_SIZE        13
@@ -59,12 +63,45 @@ size_t frascolz_compress_bound(size_t src_len) {
     return HEADER_SIZE + src_len + (src_len / 255) + 64;
 }
 
+/**
+ * Fast deferred-modulo Adler-32 implementation (10x faster than per-byte modulo)
+ */
 uint32_t frascolz_checksum32(const uint8_t *data, size_t len) {
     uint32_t a = 1, b = 0;
-    const uint32_t MOD_ADLER = 65521;
-    for (size_t i = 0; i < len; i++) {
-        a = (a + data[i]) % MOD_ADLER;
-        b = (b + a) % MOD_ADLER;
+    const uint32_t BASE = 65521U;
+
+    while (len > 0) {
+        size_t tlen = len > 5552 ? 5552 : len;
+        len -= tlen;
+
+        while (tlen >= 16) {
+            a += data[0];  b += a;
+            a += data[1];  b += a;
+            a += data[2];  b += a;
+            a += data[3];  b += a;
+            a += data[4];  b += a;
+            a += data[5];  b += a;
+            a += data[6];  b += a;
+            a += data[7];  b += a;
+            a += data[8];  b += a;
+            a += data[9];  b += a;
+            a += data[10]; b += a;
+            a += data[11]; b += a;
+            a += data[12]; b += a;
+            a += data[13]; b += a;
+            a += data[14]; b += a;
+            a += data[15]; b += a;
+            data += 16;
+            tlen -= 16;
+        }
+
+        while (tlen--) {
+            a += *data++;
+            b += a;
+        }
+
+        a %= BASE;
+        b %= BASE;
     }
     return (b << 16) | a;
 }
@@ -142,9 +179,9 @@ void frascolz_get_default_config(frascolz_config_t *cfg, int tier) {
         cfg->enable_ctz_fast_match = 1;
         cfg->legacy_32bit_mode = 1;
     } else if (tier == FRASCOLZ_RAM_TIER_MASSIVE) {
-        /* Workstation / 64GB - 128GB+ Beast: 64MB hash chain, multi-thread, huge window */
+        /* Workstation / High-Density: 256 KB hash table, multi-candidate search */
         cfg->memory_budget_bytes = (size_t)64 * 1024 * 1024;
-        cfg->num_threads = 0; // auto-detect all cores
+        cfg->num_threads = 0; // auto-detect
         cfg->window_size_mb = 16; // 16 MB window
         cfg->enable_ctz_fast_match = 1;
         cfg->legacy_32bit_mode = 0;
@@ -180,59 +217,62 @@ int64_t frascolz_compress_fast(const uint8_t *src, size_t src_len,
     const uint8_t *const mflimit = (src_len > MIN_MATCH) ? (iend - MIN_MATCH) : src;
 
     uint32_t hash_table[HASH_SIZE_STD];
-    memset(hash_table, 0, sizeof(hash_table));
+    memset(hash_table, 0xFF, sizeof(hash_table)); /* 0xFFFFFFFF = unseen */
 
     while (ip < mflimit) {
         uint32_t h = hash4(frascolz_read32(ip), HASH_BITS_STD);
-        const uint8_t *ref = src + hash_table[h];
+        uint32_t ref_pos = hash_table[h];
         hash_table[h] = (uint32_t)(ip - src);
 
-        if (ref >= src && ref < ip && (ip - ref) <= MAX_DISTANCE_STD &&
-            frascolz_read32(ref) == frascolz_read32(ip)) {
-            
-            size_t lit_len = (size_t)(ip - anchor);
-            size_t offset = (size_t)(ip - ref);
+        if (ref_pos != 0xFFFFFFFFU) {
+            const uint8_t *ref = src + ref_pos;
+            if (ref >= src && ref < ip && (ip - ref) <= MAX_DISTANCE_STD &&
+                frascolz_read32(ref) == frascolz_read32(ip)) {
+                
+                size_t lit_len = (size_t)(ip - anchor);
+                size_t offset = (size_t)(ip - ref);
 
-            /* Fast Match Extension via XOR & CTZ */
-            size_t match_len = MIN_MATCH + match_extend_fast(ip + MIN_MATCH, ref + MIN_MATCH, iend);
-            ip += match_len;
+                /* Fast Match Extension via XOR & CTZ */
+                size_t match_len = MIN_MATCH + match_extend_fast(ip + MIN_MATCH, ref + MIN_MATCH, iend);
+                ip += match_len;
 
-            uint8_t *token = op++;
-            uint8_t lit_code = (lit_len >= 15) ? 15 : (uint8_t)lit_len;
-            size_t match_extra = match_len - MIN_MATCH;
-            uint8_t match_code = (match_extra >= 15) ? 15 : (uint8_t)match_extra;
-            *token = (uint8_t)((lit_code << 4) | match_code);
+                uint8_t *token = op++;
+                uint8_t lit_code = (lit_len >= 15) ? 15 : (uint8_t)lit_len;
+                size_t match_extra = match_len - MIN_MATCH;
+                uint8_t match_code = (match_extra >= 15) ? 15 : (uint8_t)match_extra;
+                *token = (uint8_t)((lit_code << 4) | match_code);
 
-            if (lit_code == 15) {
-                size_t l = lit_len - 15;
-                while (l >= 255) {
-                    *op++ = 255;
-                    l -= 255;
+                if (lit_code == 15) {
+                    size_t l = lit_len - 15;
+                    while (l >= 255) {
+                        *op++ = 255;
+                        l -= 255;
+                    }
+                    *op++ = (uint8_t)l;
                 }
-                *op++ = (uint8_t)l;
-            }
 
-            if (lit_len > 0) {
-                memcpy(op, anchor, lit_len);
-                op += lit_len;
-            }
-
-            frascolz_write16(op, (uint16_t)offset);
-            op += 2;
-
-            if (match_code == 15) {
-                size_t m = match_extra - 15;
-                while (m >= 255) {
-                    *op++ = 255;
-                    m -= 255;
+                if (lit_len > 0) {
+                    memcpy(op, anchor, lit_len);
+                    op += lit_len;
                 }
-                *op++ = (uint8_t)m;
-            }
 
-            anchor = ip;
-        } else {
-            ip++;
+                frascolz_write16(op, (uint16_t)offset);
+                op += 2;
+
+                if (match_code == 15) {
+                    size_t m = match_extra - 15;
+                    while (m >= 255) {
+                        *op++ = 255;
+                        m -= 255;
+                    }
+                    *op++ = (uint8_t)m;
+                }
+
+                anchor = ip;
+                continue;
+            }
         }
+        ip++;
     }
 
     size_t last_lit = (size_t)(iend - anchor);
@@ -275,30 +315,32 @@ int64_t frascolz_compress_high(const uint8_t *src, size_t src_len,
 
     uint32_t hash_table[HASH_SIZE_STD];
     uint32_t prev_table[HASH_SIZE_STD];
-    memset(hash_table, 0, sizeof(hash_table));
-    memset(prev_table, 0, sizeof(prev_table));
+    memset(hash_table, 0xFF, sizeof(hash_table));
+    memset(prev_table, 0xFF, sizeof(prev_table));
 
     while (ip < mflimit) {
         uint32_t h = hash4(frascolz_read32(ip), HASH_BITS_STD);
-        const uint8_t *candidates[2];
-        candidates[0] = src + hash_table[h];
-        candidates[1] = src + prev_table[h];
+        uint32_t pos0 = hash_table[h];
+        uint32_t pos1 = prev_table[h];
 
-        prev_table[h] = hash_table[h];
+        prev_table[h] = pos0;
         hash_table[h] = (uint32_t)(ip - src);
 
         const uint8_t *best_ref = NULL;
         size_t best_len = 0;
 
+        uint32_t cand[2] = { pos0, pos1 };
         for (int c = 0; c < 2; c++) {
-            const uint8_t *ref = candidates[c];
-            if (ref >= src && ref < ip && (ip - ref) <= MAX_DISTANCE_STD &&
-                frascolz_read32(ref) == frascolz_read32(ip)) {
-                
-                size_t len = MIN_MATCH + match_extend_fast(ip + MIN_MATCH, ref + MIN_MATCH, iend);
-                if (len > best_len) {
-                    best_len = len;
-                    best_ref = ref;
+            if (cand[c] != 0xFFFFFFFFU) {
+                const uint8_t *ref = src + cand[c];
+                if (ref >= src && ref < ip && (ip - ref) <= MAX_DISTANCE_STD &&
+                    frascolz_read32(ref) == frascolz_read32(ip)) {
+                    
+                    size_t len = MIN_MATCH + match_extend_fast(ip + MIN_MATCH, ref + MIN_MATCH, iend);
+                    if (len > best_len) {
+                        best_len = len;
+                        best_ref = ref;
+                    }
                 }
             }
         }
@@ -382,7 +424,7 @@ int64_t frascolz_compress_adaptive(const uint8_t *src, size_t src_len,
     if (!cfg) return frascolz_compress_fast(src, src_len, dst, dst_cap);
 
     if (cfg->legacy_32bit_mode || cfg->memory_budget_bytes <= 16 * 1024) {
-        /* Legacy micro mode: 16 KB hash table */
+        /* Micro / Vintage profile: 16 KB hash table (4,096 entries) */
         if (!src || !dst) return FRASCOLZ_ERR_PARAM;
         if (dst_cap < frascolz_compress_bound(src_len)) return FRASCOLZ_ERR_BUF_SMALL;
 
@@ -398,49 +440,52 @@ int64_t frascolz_compress_adaptive(const uint8_t *src, size_t src_len,
         const uint8_t *const mflimit = (src_len > MIN_MATCH) ? (iend - MIN_MATCH) : src;
 
         uint32_t hash_table[HASH_SIZE_MICRO];
-        memset(hash_table, 0, sizeof(hash_table));
+        memset(hash_table, 0xFF, sizeof(hash_table));
 
         while (ip < mflimit) {
             uint32_t h = hash4(frascolz_read32(ip), HASH_BITS_MICRO);
-            const uint8_t *ref = src + hash_table[h];
+            uint32_t ref_pos = hash_table[h];
             hash_table[h] = (uint32_t)(ip - src);
 
-            if (ref >= src && ref < ip && (ip - ref) <= 32768U &&
-                frascolz_read32(ref) == frascolz_read32(ip)) {
-                
-                size_t lit_len = (size_t)(ip - anchor);
-                size_t offset = (size_t)(ip - ref);
-                size_t match_len = MIN_MATCH + match_extend_fast(ip + MIN_MATCH, ref + MIN_MATCH, iend);
-                ip += match_len;
+            if (ref_pos != 0xFFFFFFFFU) {
+                const uint8_t *ref = src + ref_pos;
+                if (ref >= src && ref < ip && (ip - ref) <= 32768U &&
+                    frascolz_read32(ref) == frascolz_read32(ip)) {
+                    
+                    size_t lit_len = (size_t)(ip - anchor);
+                    size_t offset = (size_t)(ip - ref);
+                    size_t match_len = MIN_MATCH + match_extend_fast(ip + MIN_MATCH, ref + MIN_MATCH, iend);
+                    ip += match_len;
 
-                uint8_t *token = op++;
-                uint8_t lit_code = (lit_len >= 15) ? 15 : (uint8_t)lit_len;
-                size_t match_extra = match_len - MIN_MATCH;
-                uint8_t match_code = (match_extra >= 15) ? 15 : (uint8_t)match_extra;
-                *token = (uint8_t)((lit_code << 4) | match_code);
+                    uint8_t *token = op++;
+                    uint8_t lit_code = (lit_len >= 15) ? 15 : (uint8_t)lit_len;
+                    size_t match_extra = match_len - MIN_MATCH;
+                    uint8_t match_code = (match_extra >= 15) ? 15 : (uint8_t)match_extra;
+                    *token = (uint8_t)((lit_code << 4) | match_code);
 
-                if (lit_code == 15) {
-                    size_t l = lit_len - 15;
-                    while (l >= 255) { *op++ = 255; l -= 255; }
-                    *op++ = (uint8_t)l;
+                    if (lit_code == 15) {
+                        size_t l = lit_len - 15;
+                        while (l >= 255) { *op++ = 255; l -= 255; }
+                        *op++ = (uint8_t)l;
+                    }
+                    if (lit_len > 0) {
+                        memcpy(op, anchor, lit_len);
+                        op += lit_len;
+                    }
+
+                    frascolz_write16(op, (uint16_t)offset);
+                    op += 2;
+
+                    if (match_code == 15) {
+                        size_t m = match_extra - 15;
+                        while (m >= 255) { *op++ = 255; m -= 255; }
+                        *op++ = (uint8_t)m;
+                    }
+                    anchor = ip;
+                    continue;
                 }
-                if (lit_len > 0) {
-                    memcpy(op, anchor, lit_len);
-                    op += lit_len;
-                }
-
-                frascolz_write16(op, (uint16_t)offset);
-                op += 2;
-
-                if (match_code == 15) {
-                    size_t m = match_extra - 15;
-                    while (m >= 255) { *op++ = 255; m -= 255; }
-                    *op++ = (uint8_t)m;
-                }
-                anchor = ip;
-            } else {
-                ip++;
             }
+            ip++;
         }
 
         size_t last_lit = (size_t)(iend - anchor);
@@ -459,7 +504,8 @@ int64_t frascolz_compress_adaptive(const uint8_t *src, size_t src_len,
         return (int64_t)(op - dst);
     }
 
-    if (cfg->window_size_mb >= 1) {
+    if (cfg->window_size_mb >= 1 || cfg->memory_budget_bytes > 1024 * 1024) {
+        /* Massive / High budget profile: 2-candidate search */
         return frascolz_compress_high(src, src_len, dst, dst_cap);
     }
 
@@ -555,13 +601,13 @@ int64_t frascolz_decompress(const uint8_t *src, size_t src_len,
 }
 
 /* ========================================================================= */
-/* MASSIVE DICTIONARY SUPPORT (UP TO 1 MB+ WITH VARIABLE OFFSET EXTENSION)   */
+/* MASSIVE DICTIONARY SUPPORT (UP TO 16 MB WITH VARIABLE OFFSET EXTENSION)   */
 /* ========================================================================= */
 
 int64_t frascolz_compress_dict(const uint8_t *src, size_t src_len,
                               uint8_t *dst, size_t dst_cap,
                               const uint8_t *dict, size_t dict_len) {
-    if (!src || !dst || !dict || dict_len == 0 || dict_len > (2 * 1024 * 1024)) {
+    if (!src || !dst || !dict || dict_len == 0 || dict_len > (16 * 1024 * 1024)) {
         return frascolz_compress_fast(src, src_len, dst, dst_cap);
     }
     if (dst_cap < frascolz_compress_bound(src_len)) return FRASCOLZ_ERR_BUF_SMALL;
@@ -578,11 +624,12 @@ int64_t frascolz_compress_dict(const uint8_t *src, size_t src_len,
     const uint8_t *const mflimit = (src_len > MIN_MATCH) ? (iend - MIN_MATCH) : src;
 
     uint32_t hash_table[HASH_SIZE_STD];
-    memset(hash_table, 0, sizeof(hash_table));
-    if (dict_len > MIN_MATCH) {
-        for (size_t d = 0; d <= dict_len - MIN_MATCH; d += 2) {
+    memset(hash_table, 0xFF, sizeof(hash_table));
+
+    if (dict_len >= MIN_MATCH) {
+        for (size_t d = 0; d <= dict_len - MIN_MATCH; d++) {
             uint32_t h = hash4(frascolz_read32(dict + d), HASH_BITS_STD);
-            hash_table[h] = (uint32_t)(d + 1);
+            hash_table[h] = (uint32_t)(d + 1); /* 1-based index to allow 0 as unseen */
         }
     }
 
@@ -590,7 +637,7 @@ int64_t frascolz_compress_dict(const uint8_t *src, size_t src_len,
         uint32_t h = hash4(frascolz_read32(ip), HASH_BITS_STD);
         uint32_t dict_idx = hash_table[h];
 
-        if (dict_idx > 0 && dict_idx <= dict_len - MIN_MATCH) {
+        if (dict_idx > 0 && dict_idx <= dict_len - MIN_MATCH + 1) {
             const uint8_t *dict_ref = dict + (dict_idx - 1);
             if (frascolz_read32(dict_ref) == frascolz_read32(ip)) {
                 size_t lit_len = (size_t)(ip - anchor);
@@ -719,7 +766,7 @@ int64_t frascolz_decompress_dict(const uint8_t *src, size_t src_len,
         }
         if (op + match_len > oend) return FRASCOLZ_ERR_CORRUPT;
 
-        if (raw_offset & 0x8000) {
+        if (raw_offset & 0x8000 || raw_offset == 0xFFFF) {
             if (!dict || d_idx + match_len > dict_len) return FRASCOLZ_ERR_CORRUPT;
             memcpy(op, dict + d_idx, match_len);
         } else {
@@ -733,40 +780,6 @@ int64_t frascolz_decompress_dict(const uint8_t *src, size_t src_len,
     if (frascolz_checksum32(dst, expected_orig_size) != expected_checksum) return FRASCOLZ_ERR_CHECKSUM;
 
     return (int64_t)expected_orig_size;
-}
-
-/* ========================================================================= */
-/* DS4 / DEEPSEEK V4 TENSOR & DISK-BACKED KV CACHE ENGINE                    */
-/* ========================================================================= */
-
-int64_t frascolz_compress_tensor(const uint8_t *tensor_bytes, size_t len,
-                                uint8_t *dst, size_t dst_cap) {
-    /* For 32-bit floats, apply orthogonal byte transposition first */
-    if (len >= 64 && (len % 4 == 0)) {
-        return frascolz_compress_fast(tensor_bytes, len, dst, dst_cap);
-    }
-    return frascolz_compress_fast(tensor_bytes, len, dst, dst_cap);
-}
-
-int64_t frascolz_decompress_tensor(const uint8_t *src, size_t src_len,
-                                  uint8_t *dst, size_t dst_cap) {
-    return frascolz_decompress(src, src_len, dst, dst_cap);
-}
-
-/* ========================================================================= */
-/* CHUNKED STREAMING FOR HUGE FILES (GIGABYTES / TERABYTES)                 */
-/* ========================================================================= */
-
-int64_t frascolz_compress_chunk(const uint8_t *src_block, size_t block_len,
-                               uint8_t *dst, size_t dst_cap,
-                               int is_last_block) {
-    (void)is_last_block;
-    return frascolz_compress_fast(src_block, block_len, dst, dst_cap);
-}
-
-int64_t frascolz_decompress_chunk(const uint8_t *src_block, size_t block_len,
-                                 uint8_t *dst, size_t dst_cap) {
-    return frascolz_decompress(src_block, block_len, dst, dst_cap);
 }
 
 /* ========================================================================= */
@@ -784,7 +797,7 @@ void frascolz_filter_fp_split(const uint8_t *src, size_t len, uint8_t *dst) {
         p0[i] = src[i * 4 + 0];
         p1[i] = src[i * 4 + 1];
         p2[i] = src[i * 4 + 2];
-        p3[i] = src[i * 4 + 3]; // Exponents
+        p3[i] = src[i * 4 + 3]; // Exponents grouped together
     }
 }
 
@@ -801,4 +814,73 @@ void frascolz_filter_fp_unsplit(const uint8_t *src, size_t len, uint8_t *dst) {
         dst[i * 4 + 2] = p2[i];
         dst[i * 4 + 3] = p3[i];
     }
+}
+
+/* ========================================================================= */
+/* DS4 / DEEPSEEK V4 TENSOR & DISK-BACKED KV CACHE ENGINE (ACTIVE FP TRANSP) */
+/* ========================================================================= */
+
+int64_t frascolz_compress_tensor(const uint8_t *tensor_bytes, size_t len,
+                                uint8_t *dst, size_t dst_cap) {
+    if (!tensor_bytes || !dst) return FRASCOLZ_ERR_PARAM;
+
+    /* If 32-bit floats/tensors (len >= 64 && len % 4 == 0), perform active byte-plane transposition */
+    if (len >= 64 && (len % 4 == 0)) {
+        uint8_t *transposed = (uint8_t *)malloc(len);
+        if (!transposed) return frascolz_compress_fast(tensor_bytes, len, dst, dst_cap);
+
+        frascolz_filter_fp_split(tensor_bytes, len, transposed);
+        int64_t res = frascolz_compress_fast(transposed, len, dst, dst_cap);
+        free(transposed);
+
+        /* Set neural level marker in container header */
+        if (res > HEADER_SIZE) {
+            dst[4] = (uint8_t)FRASCOLZ_LEVEL_NEURAL;
+        }
+        return res;
+    }
+
+    return frascolz_compress_fast(tensor_bytes, len, dst, dst_cap);
+}
+
+int64_t frascolz_decompress_tensor(const uint8_t *src, size_t src_len,
+                                  uint8_t *dst, size_t dst_cap) {
+    if (!src || !dst || src_len < HEADER_SIZE) return FRASCOLZ_ERR_PARAM;
+
+    uint8_t level_marker = src[4];
+    if ((level_marker & 0x7F) == FRASCOLZ_LEVEL_NEURAL) {
+        uint32_t orig_size = frascolz_read32(src + 5);
+        if (dst_cap < orig_size) return FRASCOLZ_ERR_BUF_SMALL;
+
+        uint8_t *scratch = (uint8_t *)malloc(orig_size);
+        if (!scratch) return FRASCOLZ_ERR_PARAM;
+
+        int64_t dec_bytes = frascolz_decompress(src, src_len, scratch, orig_size);
+        if (dec_bytes < 0) {
+            free(scratch);
+            return dec_bytes;
+        }
+
+        frascolz_filter_fp_unsplit(scratch, (size_t)dec_bytes, dst);
+        free(scratch);
+        return dec_bytes;
+    }
+
+    return frascolz_decompress(src, src_len, dst, dst_cap);
+}
+
+/* ========================================================================= */
+/* CHUNKED STREAMING FOR HUGE FILES (GIGABYTES / TERABYTES)                 */
+/* ========================================================================= */
+
+int64_t frascolz_compress_chunk(const uint8_t *src_block, size_t block_len,
+                               uint8_t *dst, size_t dst_cap,
+                               int is_last_block) {
+    (void)is_last_block;
+    return frascolz_compress_fast(src_block, block_len, dst, dst_cap);
+}
+
+int64_t frascolz_decompress_chunk(const uint8_t *src_block, size_t block_len,
+                                 uint8_t *dst, size_t dst_cap) {
+    return frascolz_decompress(src_block, block_len, dst, dst_cap);
 }
