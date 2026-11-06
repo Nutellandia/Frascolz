@@ -505,8 +505,90 @@ int64_t frascolz_compress_adaptive(const uint8_t *src, size_t src_len,
     }
 
     if (cfg->window_size_mb >= 1 || cfg->memory_budget_bytes > 1024 * 1024) {
-        /* Massive / High budget profile: 2-candidate search */
-        return frascolz_compress_high(src, src_len, dst, dst_cap);
+        /* MASSIVE 256 KB Hash Table (65,536 entries) for >1MB memory budgets */
+        if (!src || !dst) return FRASCOLZ_ERR_PARAM;
+        if (dst_cap < frascolz_compress_bound(src_len)) return FRASCOLZ_ERR_BUF_SMALL;
+
+        uint32_t *massive_hash = (uint32_t *)malloc(HASH_SIZE_MASSIVE * sizeof(uint32_t));
+        if (!massive_hash) return frascolz_compress_high(src, src_len, dst, dst_cap);
+
+        memset(massive_hash, 0xFF, HASH_SIZE_MASSIVE * sizeof(uint32_t));
+
+        frascolz_write32(dst, FRASCOLZ_MAGIC);
+        dst[4] = (uint8_t)FRASCOLZ_LEVEL_HIGH;
+        frascolz_write32(dst + 5, (uint32_t)src_len);
+        frascolz_write32(dst + 9, frascolz_checksum32(src, src_len));
+
+        uint8_t *op = dst + HEADER_SIZE;
+        const uint8_t *ip = src;
+        const uint8_t *anchor = src;
+        const uint8_t *const iend = src + src_len;
+        const uint8_t *const mflimit = (src_len > MIN_MATCH) ? (iend - MIN_MATCH) : src;
+
+        while (ip < mflimit) {
+            uint32_t h = hash4(frascolz_read32(ip), HASH_BITS_MASSIVE);
+            uint32_t ref_pos = massive_hash[h];
+            massive_hash[h] = (uint32_t)(ip - src);
+
+            if (ref_pos != 0xFFFFFFFFU) {
+                const uint8_t *ref = src + ref_pos;
+                if (ref >= src && ref < ip && (ip - ref) <= MAX_DISTANCE_STD &&
+                    frascolz_read32(ref) == frascolz_read32(ip)) {
+                    
+                    size_t lit_len = (size_t)(ip - anchor);
+                    size_t offset = (size_t)(ip - ref);
+                    size_t match_len = MIN_MATCH + match_extend_fast(ip + MIN_MATCH, ref + MIN_MATCH, iend);
+                    ip += match_len;
+
+                    uint8_t *token = op++;
+                    uint8_t lit_code = (lit_len >= 15) ? 15 : (uint8_t)lit_len;
+                    size_t match_extra = match_len - MIN_MATCH;
+                    uint8_t match_code = (match_extra >= 15) ? 15 : (uint8_t)match_extra;
+                    *token = (uint8_t)((lit_code << 4) | match_code);
+
+                    if (lit_code == 15) {
+                        size_t l = lit_len - 15;
+                        while (l >= 255) { *op++ = 255; l -= 255; }
+                        *op++ = (uint8_t)l;
+                    }
+                    if (lit_len > 0) {
+                        memcpy(op, anchor, lit_len);
+                        op += lit_len;
+                    }
+
+                    frascolz_write16(op, (uint16_t)offset);
+                    op += 2;
+
+                    if (match_code == 15) {
+                        size_t m = match_extra - 15;
+                        while (m >= 255) { *op++ = 255; m -= 255; }
+                        *op++ = (uint8_t)m;
+                    }
+
+                    anchor = ip;
+                    continue;
+                }
+            }
+            ip++;
+        }
+
+        size_t last_lit = (size_t)(iend - anchor);
+        if (last_lit > 0) {
+            uint8_t *token = op++;
+            uint8_t lit_code = (last_lit >= 15) ? 15 : (uint8_t)last_lit;
+            *token = (uint8_t)(lit_code << 4);
+
+            if (lit_code == 15) {
+                size_t l = last_lit - 15;
+                while (l >= 255) { *op++ = 255; l -= 255; }
+                *op++ = (uint8_t)l;
+            }
+            memcpy(op, anchor, last_lit);
+            op += last_lit;
+        }
+
+        free(massive_hash);
+        return (int64_t)(op - dst);
     }
 
     return frascolz_compress_fast(src, src_len, dst, dst_cap);
@@ -876,11 +958,22 @@ int64_t frascolz_decompress_tensor(const uint8_t *src, size_t src_len,
 int64_t frascolz_compress_chunk(const uint8_t *src_block, size_t block_len,
                                uint8_t *dst, size_t dst_cap,
                                int is_last_block) {
-    (void)is_last_block;
-    return frascolz_compress_fast(src_block, block_len, dst, dst_cap);
+    if (!src_block || !dst) return FRASCOLZ_ERR_PARAM;
+    if (dst_cap < frascolz_compress_bound(block_len) + 1) return FRASCOLZ_ERR_BUF_SMALL;
+
+    int64_t comp_bytes = frascolz_compress_fast(src_block, block_len, dst, dst_cap);
+    if (comp_bytes <= 0) return comp_bytes;
+
+    /* Embed stream chunk flag into container header byte 4: 
+       bit 0: 1 = intermediate chunk, 0 = final chunk */
+    uint8_t chunk_flag = is_last_block ? 0x00 : 0x01;
+    dst[4] = (uint8_t)(dst[4] | (chunk_flag << 6));
+
+    return comp_bytes;
 }
 
 int64_t frascolz_decompress_chunk(const uint8_t *src_block, size_t block_len,
                                  uint8_t *dst, size_t dst_cap) {
+    if (!src_block || !dst || block_len < HEADER_SIZE) return FRASCOLZ_ERR_PARAM;
     return frascolz_decompress(src_block, block_len, dst, dst_cap);
 }
