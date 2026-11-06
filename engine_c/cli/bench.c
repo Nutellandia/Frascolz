@@ -15,7 +15,7 @@ static double get_time_sec(void) {
     return (double)clock() / CLOCKS_PER_SEC;
 }
 
-static void benchmark_json_text_dataset(void) {
+static int benchmark_json_text_dataset(void) {
     printf("\n--- 1. BENCHMARK: JSON & Repetitive Text (1.0 MB Buffer) ---\n");
     size_t size = 1024 * 1024;
     uint8_t *src = (uint8_t *)malloc(size);
@@ -61,24 +61,31 @@ static void benchmark_json_text_dataset(void) {
     t1 = get_time_sec();
     double mas_c_speed = ((double)size * iters / (1024.0 * 1024.0)) / (t1 - t0);
 
-    int64_t dsize_mas = frascolz_decompress(comp, (size_t)csize_mas, decomp, size + 256);
+    t0 = get_time_sec();
+    int64_t dsize_mas = 0;
+    for (int i = 0; i < iters; i++) {
+        dsize_mas = frascolz_decompress(comp, (size_t)csize_mas, decomp, size + 256);
+    }
+    t1 = get_time_sec();
+    double mas_d_speed = ((double)size * iters / (1024.0 * 1024.0)) / (t1 - t0);
+
     int mas_ok = (dsize_mas == (int64_t)size && memcmp(src, decomp, size) == 0);
 
     printf("  [STD 64KB Profile]     Compress: %7.1f MB/s | Decompress: %7.1f MB/s | Ratio: %5.2f%% | Roundtrip: %s\n",
            fast_c_speed, fast_d_speed, (double)csize_fast / size * 100.0, fast_ok ? "PASSED" : "FAILED");
     printf("  [MASSIVE 256KB Tier]   Compress: %7.1f MB/s | Decompress: %7.1f MB/s | Ratio: %5.2f%% | Roundtrip: %s\n",
-           mas_c_speed, fast_d_speed, (double)csize_mas / size * 100.0, mas_ok ? "PASSED" : "FAILED");
+           mas_c_speed, mas_d_speed, (double)csize_mas / size * 100.0, mas_ok ? "PASSED" : "FAILED");
 
     free(src); free(comp); free(decomp);
+    return fast_ok && mas_ok;
 }
 
-static void benchmark_fp32_tensor_dataset(void) {
+static int benchmark_fp32_tensor_dataset(void) {
     printf("\n--- 2. BENCHMARK: Realistic Neural FP32 Weights (1.0 MB / 262,144 Float32s) ---\n");
     size_t count = 262144;
     size_t bytes = count * sizeof(float);
     float *tensor = (float *)malloc(bytes);
     
-    /* Realistic neural model weights: continuous smooth values with shared exponents and varying mantissas */
     for (size_t i = 0; i < count; i++) {
         tensor[i] = (float)(sin((double)i * 0.05) * 0.125 + cos((double)i * 0.01) * 0.5);
     }
@@ -89,10 +96,8 @@ static void benchmark_fp32_tensor_dataset(void) {
 
     int iters = 25;
 
-    /* A. Standard Compress without Byte-Plane Split */
     int64_t raw_csize = frascolz_compress_fast((const uint8_t *)tensor, bytes, comp, cap);
 
-    /* B. Tensor Compress with Active Byte-Plane Split */
     double t0 = get_time_sec();
     int64_t fp_csize = 0;
     for (int i = 0; i < iters; i++) {
@@ -117,35 +122,43 @@ static void benchmark_fp32_tensor_dataset(void) {
            fp_c_speed, fp_d_speed, (double)fp_csize / bytes * 100.0, fp_ok ? "PASSED" : "FAILED");
 
     free(tensor); free(comp); free(decomp);
+    return fp_ok;
 }
 
-static void benchmark_dictionary_dataset(void) {
-    printf("\n--- 3. BENCHMARK: Pre-Shared 16MB Dictionary (Dual-Search Dict+Src) ---\n");
-    const char *dict_str = "KeySchemaIdNameUserAddressPayloadHeaderTimestampAccessTokenSignature";
-    size_t dict_len = strlen(dict_str);
-    const char *payload_str = "PayloadHeaderTimestampPayloadHeaderTimestampNameUserAddressAccessTokenSignatureKeySchemaId";
-    size_t payload_len = strlen(payload_str);
+static int benchmark_dictionary_dataset(void) {
+    printf("\n--- 3. BENCHMARK: Pre-Shared 1MB Dictionary (Dual-Search Dict+Src) ---\n");
+    size_t dict_bytes = 1024 * 1024; // 1 MB Dictionary
+    size_t payload_bytes = 256 * 1024; // 256 KB Payload Stream
 
-    size_t cap = frascolz_compress_bound(payload_len);
+    uint8_t *dict_buf = (uint8_t *)malloc(dict_bytes);
+    uint8_t *payload_buf = (uint8_t *)malloc(payload_bytes);
+
+    const char *schema = "{\"id\":1001,\"schema\":\"frascolz_v3_schema\",\"key\":\"access_token_bearer_signature_2026\"},";
+    size_t slen = strlen(schema);
+
+    for (size_t i = 0; i < dict_bytes; i++) dict_buf[i] = (uint8_t)schema[i % slen];
+    for (size_t i = 0; i < payload_bytes; i++) payload_buf[i] = (uint8_t)schema[i % slen];
+
+    size_t cap = frascolz_compress_bound(payload_bytes);
     uint8_t *comp = (uint8_t *)malloc(cap);
-    uint8_t *decomp = (uint8_t *)malloc(payload_len + 128);
+    uint8_t *decomp = (uint8_t *)malloc(payload_bytes + 256);
 
-    /* CORRECT ARGUMENT ORDER: (src, src_len, dst, dst_cap, dict, dict_len) */
-    int64_t dict_csize = frascolz_compress_dict((const uint8_t *)payload_str, payload_len,
+    int64_t dict_csize = frascolz_compress_dict(payload_buf, payload_bytes,
                                                 comp, cap,
-                                                (const uint8_t *)dict_str, dict_len);
+                                                dict_buf, dict_bytes);
 
     int64_t dict_dsize = frascolz_decompress_dict(comp, (size_t)dict_csize,
-                                                  decomp, payload_len + 128,
-                                                  (const uint8_t *)dict_str, dict_len);
+                                                  decomp, payload_bytes + 256,
+                                                  dict_buf, dict_bytes);
 
-    int dict_ok = (dict_dsize == (int64_t)payload_len && memcmp(payload_str, decomp, payload_len) == 0);
+    int dict_ok = (dict_dsize == (int64_t)payload_bytes && memcmp(payload_buf, decomp, payload_bytes) == 0);
 
-    printf("  [Dual-Search Dict]     Original: %zu B -> Compressed: %ld B (Ratio: %.2f%%, Lossless OK: %s)\n",
-           payload_len, (long)dict_csize, (double)dict_csize / payload_len * 100.0,
-           dict_ok ? "YES (PASSED)" : "NO (FAILED)");
+    printf("  [Dual-Search 1MB Dict] Payload: %zu KB -> Compressed: %ld B (Ratio: %.2f%% | Roundtrip: %s)\n",
+           payload_bytes / 1024, (long)dict_csize, (double)dict_csize / payload_bytes * 100.0,
+           dict_ok ? "PASSED" : "FAILED");
 
-    free(comp); free(decomp);
+    free(dict_buf); free(payload_buf); free(comp); free(decomp);
+    return dict_ok;
 }
 
 static void run_corruption_fuzzing_audit(void) {
@@ -192,11 +205,12 @@ int main(int argc, char **argv) {
     printf("  Created by Emilio Frascogna (FRS Software)                          \n");
     printf("=======================================================================\n");
 
-    benchmark_json_text_dataset();
-    benchmark_fp32_tensor_dataset();
-    benchmark_dictionary_dataset();
+    int json_ok = benchmark_json_text_dataset();
+    int fp_ok = benchmark_fp32_tensor_dataset();
+    int dict_ok = benchmark_dictionary_dataset();
     run_corruption_fuzzing_audit();
 
-    printf("\n>>> VERDICT: All benchmarks & roundtrips passed 100%% bit-a-bit! <<<\n\n");
-    return 0;
+    int all_ok = json_ok && fp_ok && dict_ok;
+    printf("\n>>> OVERALL VERDICT: %s <<<\n\n", all_ok ? "PASSED (100% Bit-a-Bit Verified)" : "FAILED");
+    return all_ok ? 0 : 1;
 }
