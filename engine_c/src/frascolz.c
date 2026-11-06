@@ -729,24 +729,31 @@ int64_t frascolz_compress_dict(const uint8_t *src, size_t src_len,
     const uint8_t *const iend = src + src_len;
     const uint8_t *const mflimit = (src_len > MIN_MATCH) ? (iend - MIN_MATCH) : src;
 
-    uint32_t hash_table[HASH_SIZE_STD];
-    memset(hash_table, 0xFF, sizeof(hash_table));
+    uint32_t dict_hash[HASH_SIZE_STD];
+    uint32_t src_hash[HASH_SIZE_STD];
+    memset(dict_hash, 0, sizeof(dict_hash));
+    memset(src_hash, 0xFF, sizeof(src_hash));
 
     if (dict_len >= MIN_MATCH) {
         for (size_t d = 0; d <= dict_len - MIN_MATCH; d++) {
             uint32_t h = hash4(frascolz_read32(dict + d), HASH_BITS_STD);
-            hash_table[h] = (uint32_t)(d + 1); /* 1-based index to allow 0 as unseen */
+            dict_hash[h] = (uint32_t)(d + 1); /* 1-based index to allow 0 as unseen */
         }
     }
 
     while (ip < mflimit) {
         uint32_t h = hash4(frascolz_read32(ip), HASH_BITS_STD);
-        uint32_t dict_idx = hash_table[h];
+        uint32_t dict_idx = dict_hash[h];
+        uint32_t src_pos = src_hash[h];
+        src_hash[h] = (uint32_t)(ip - src);
+
+        const uint8_t *best_dict_ref = NULL;
+        size_t best_dict_len = 0;
+        size_t d_pos_match = 0;
 
         if (dict_idx > 0 && dict_idx <= dict_len - MIN_MATCH + 1) {
             const uint8_t *dict_ref = dict + (dict_idx - 1);
             if (frascolz_read32(dict_ref) == frascolz_read32(ip)) {
-                size_t lit_len = (size_t)(ip - anchor);
                 size_t match_len = MIN_MATCH;
                 const uint8_t *const dict_end = dict + dict_len;
                 const uint8_t *dp = dict_ref + MIN_MATCH;
@@ -756,46 +763,93 @@ int64_t frascolz_compress_dict(const uint8_t *src, size_t src_len,
                     dp++;
                     match_len++;
                 }
-
-                uint8_t *token = op++;
-                uint8_t lit_code = (lit_len >= 15) ? 15 : (uint8_t)lit_len;
-                size_t match_extra = match_len - MIN_MATCH;
-                uint8_t match_code = (match_extra >= 15) ? 15 : (uint8_t)match_extra;
-                *token = (uint8_t)((lit_code << 4) | match_code);
-
-                if (lit_code == 15) {
-                    size_t l = lit_len - 15;
-                    while (l >= 255) { *op++ = 255; l -= 255; }
-                    *op++ = (uint8_t)l;
-                }
-                if (lit_len > 0) {
-                    memcpy(op, anchor, lit_len);
-                    op += lit_len;
-                }
-
-                /* Variable-length dictionary offset supporting up to 16MB */
-                size_t d_pos = dict_idx - 1;
-                if (d_pos < 0x7FFF) {
-                    frascolz_write16(op, (uint16_t)((d_pos & 0x7FFF) | 0x8000));
-                    op += 2;
-                } else {
-                    frascolz_write16(op, 0xFFFF);
-                    op += 2;
-                    *op++ = (uint8_t)(d_pos & 0xFF);
-                    *op++ = (uint8_t)((d_pos >> 8) & 0xFF);
-                    *op++ = (uint8_t)((d_pos >> 16) & 0xFF);
-                }
-
-                if (match_code == 15) {
-                    size_t m = match_extra - 15;
-                    while (m >= 255) { *op++ = 255; m -= 255; }
-                    *op++ = (uint8_t)m;
-                }
-
-                ip += match_len;
-                anchor = ip;
-                continue;
+                best_dict_len = match_len;
+                best_dict_ref = dict_ref;
+                d_pos_match = dict_idx - 1;
             }
+        }
+
+        const uint8_t *best_src_ref = NULL;
+        size_t best_src_len = 0;
+        if (src_pos != 0xFFFFFFFFU) {
+            const uint8_t *ref = src + src_pos;
+            if (ref >= src && ref < ip && (ip - ref) <= MAX_DISTANCE_STD &&
+                frascolz_read32(ref) == frascolz_read32(ip)) {
+                best_src_len = MIN_MATCH + match_extend_fast(ip + MIN_MATCH, ref + MIN_MATCH, iend);
+                best_src_ref = ref;
+            }
+        }
+
+        /* Choose dictionary match if strictly longer or if no src match exists */
+        if (best_dict_len >= MIN_MATCH && best_dict_len >= best_src_len) {
+            size_t lit_len = (size_t)(ip - anchor);
+            uint8_t *token = op++;
+            uint8_t lit_code = (lit_len >= 15) ? 15 : (uint8_t)lit_len;
+            size_t match_extra = best_dict_len - MIN_MATCH;
+            uint8_t match_code = (match_extra >= 15) ? 15 : (uint8_t)match_extra;
+            *token = (uint8_t)((lit_code << 4) | match_code);
+
+            if (lit_code == 15) {
+                size_t l = lit_len - 15;
+                while (l >= 255) { *op++ = 255; l -= 255; }
+                *op++ = (uint8_t)l;
+            }
+            if (lit_len > 0) {
+                memcpy(op, anchor, lit_len);
+                op += lit_len;
+            }
+
+            if (d_pos_match < 0x7FFF) {
+                frascolz_write16(op, (uint16_t)((d_pos_match & 0x7FFF) | 0x8000));
+                op += 2;
+            } else {
+                frascolz_write16(op, 0xFFFF);
+                op += 2;
+                *op++ = (uint8_t)(d_pos_match & 0xFF);
+                *op++ = (uint8_t)((d_pos_match >> 8) & 0xFF);
+                *op++ = (uint8_t)((d_pos_match >> 16) & 0xFF);
+            }
+
+            if (match_code == 15) {
+                size_t m = match_extra - 15;
+                while (m >= 255) { *op++ = 255; m -= 255; }
+                *op++ = (uint8_t)m;
+            }
+
+            ip += best_dict_len;
+            anchor = ip;
+            continue;
+        } else if (best_src_len >= MIN_MATCH) {
+            size_t lit_len = (size_t)(ip - anchor);
+            size_t offset = (size_t)(ip - best_src_ref);
+            uint8_t *token = op++;
+            uint8_t lit_code = (lit_len >= 15) ? 15 : (uint8_t)lit_len;
+            size_t match_extra = best_src_len - MIN_MATCH;
+            uint8_t match_code = (match_extra >= 15) ? 15 : (uint8_t)match_extra;
+            *token = (uint8_t)((lit_code << 4) | match_code);
+
+            if (lit_code == 15) {
+                size_t l = lit_len - 15;
+                while (l >= 255) { *op++ = 255; l -= 255; }
+                *op++ = (uint8_t)l;
+            }
+            if (lit_len > 0) {
+                memcpy(op, anchor, lit_len);
+                op += lit_len;
+            }
+
+            frascolz_write16(op, (uint16_t)offset);
+            op += 2;
+
+            if (match_code == 15) {
+                size_t m = match_extra - 15;
+                while (m >= 255) { *op++ = 255; m -= 255; }
+                *op++ = (uint8_t)m;
+            }
+
+            ip += best_src_len;
+            anchor = ip;
+            continue;
         }
         ip++;
     }

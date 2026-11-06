@@ -10,7 +10,7 @@ OBJS = $(SRCS:.c=.o)
 LIB = libfrascolz.a
 CLI = frascolz
 
-.PHONY: all clean test sanitize
+.PHONY: all clean test bench sanitize
 
 all: $(LIB) $(CLI)
 
@@ -26,6 +26,9 @@ $(CLI): cli/main.c $(LIB)
 test: $(CLI)
 	./$(CLI) -t
 
+bench: $(CLI)
+	./$(CLI) -b-synthetic
+
 sanitize:
 	$(CC) $(SAN_FLAGS) src/frascolz.c cli/main.c -o frascolz_san
 	./frascolz_san -t
@@ -33,3 +36,4 @@ sanitize:
 
 clean:
 	rm -f src/*.o $(LIB) $(CLI) frascolz_san test_out.frz test_decomp.bin
+
