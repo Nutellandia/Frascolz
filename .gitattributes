@@ -1,0 +1,13 @@
+# GitHub Linguist Configuration for FrascoLZ
+# Force C as the primary repository language
+
+# Treat all React/TypeScript web app and components as vendored/documentation
+src/** linguist-vendored
+src/components/** linguist-vendored
+src/core/** linguist-vendored
+public/** linguist-vendored
+
+# Ensure C engine is recognized as the core codebase
+engine_c/src/* linguist-detectable=true
+engine_c/include/* linguist-detectable=true
+engine_c/cli/* linguist-detectable=true
